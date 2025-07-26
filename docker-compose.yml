@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: borg-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  borg-coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: borg-coordinator
+    volumes:
+      - ./workspaces:/app/workspaces
+      - ./logs:/app/logs
+      - ./config:/app/config
+      # Mount Claude Code if it's installed on host
+      - ~/.claude:/root/.claude:ro
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://redis:6379
+      - CLAUDE_CODE_PATH=claude
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  borg-tui:
+    build:
+      context: .
+      dockerfile: Dockerfile.tui
+    container_name: borg-tui
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./workspaces:/app/workspaces
+      - ./logs:/app/logs
+      - ./config:/app/config
+      # Mount Claude Code if it's installed on host
+      - ~/.claude:/root/.claude:ro
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://redis:6379
+      - CLAUDE_CODE_PATH=claude
+      - TERM=xterm-256color
+    depends_on:
+      redis:
+        condition: service_healthy
+      borg-coordinator:
+        condition: service_healthy
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  default:
+    name: borg-network
