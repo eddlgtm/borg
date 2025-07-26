@@ -1,0 +1,27 @@
+FROM node:18-alpine
+
+# Install Claude Code CLI and development tools
+RUN apk add --no-cache curl bash git
+
+# Create app directory
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install all dependencies (including dev dependencies)
+RUN npm ci
+
+# Create directories for logs and workspaces
+RUN mkdir -p logs workspaces
+
+# Expose ports
+EXPOSE 3000 3001
+
+# Set environment variables
+ENV NODE_ENV=development
+ENV DASHBOARD_PORT=3000
+ENV COMMUNICATION_PORT=3001
+
+# Start the application in development mode
+CMD ["npm", "run", "dev"]

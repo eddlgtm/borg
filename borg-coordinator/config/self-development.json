@@ -1,0 +1,135 @@
+{
+  "project": {
+    "name": "Borg Coordinator Self-Development",
+    "description": "Using the Borg Coordinator system to develop and improve itself",
+    "repository": "/Users/edd/Code/borg/borg-coordinator",
+    "primaryLanguage": "TypeScript",
+    "frameworks": ["Node.js", "Express", "Socket.IO", "Redis", "Docker"]
+  },
+  "development": {
+    "workspaceTemplate": "borg-coordinator",
+    "codebasePath": "/Users/edd/Code/borg/borg-coordinator",
+    "testCommand": "npm test",
+    "buildCommand": "npm run build",
+    "lintCommand": "npm run lint",
+    "devCommand": "npm run dev"
+  },
+  "team": {
+    "supervisor": {
+      "role": "supervisor",
+      "capabilities": ["architecture", "project-management", "code-review", "typescript"],
+      "responsibilities": [
+        "Oversee feature development",
+        "Make architectural decisions",
+        "Coordinate between team members",
+        "Review and approve changes"
+      ]
+    },
+    "backend-developer": {
+      "role": "developer",
+      "capabilities": ["typescript", "node.js", "express", "redis", "docker"],
+      "responsibilities": [
+        "Implement backend features",
+        "API development",
+        "Database/Redis integration",
+        "Docker configuration"
+      ]
+    },
+    "frontend-developer": {
+      "role": "developer",
+      "capabilities": ["typescript", "javascript", "html", "css", "socket.io"],
+      "responsibilities": [
+        "Dashboard improvements",
+        "UI/UX enhancements",
+        "Real-time features",
+        "Client-side functionality"
+      ]
+    },
+    "tester": {
+      "role": "tester",
+      "capabilities": ["jest", "testing", "typescript", "integration-testing"],
+      "responsibilities": [
+        "Write comprehensive tests",
+        "Test new features",
+        "Integration testing",
+        "Quality assurance"
+      ]
+    },
+    "researcher": {
+      "role": "researcher",
+      "capabilities": ["analysis", "documentation", "research", "optimization"],
+      "responsibilities": [
+        "Research new technologies",
+        "Performance analysis",
+        "Documentation improvements",
+        "Feature feasibility studies"
+      ]
+    }
+  },
+  "workflowTemplates": {
+    "newFeature": {
+      "steps": [
+        {
+          "role": "researcher",
+          "task": "Research and analyze the feature requirements"
+        },
+        {
+          "role": "supervisor",
+          "task": "Create architectural plan and assign sub-tasks"
+        },
+        {
+          "role": "developer",
+          "task": "Implement the feature according to specifications"
+        },
+        {
+          "role": "tester",
+          "task": "Create tests for the new feature"
+        },
+        {
+          "role": "supervisor",
+          "task": "Review implementation and tests"
+        }
+      ]
+    },
+    "bugFix": {
+      "steps": [
+        {
+          "role": "researcher",
+          "task": "Investigate and identify root cause"
+        },
+        {
+          "role": "developer",
+          "task": "Implement targeted fix"
+        },
+        {
+          "role": "tester",
+          "task": "Create regression tests"
+        },
+        {
+          "role": "supervisor",
+          "task": "Review fix and approve"
+        }
+      ]
+    },
+    "refactoring": {
+      "steps": [
+        {
+          "role": "researcher",
+          "task": "Analyze current code and identify improvements"
+        },
+        {
+          "role": "supervisor",
+          "task": "Plan refactoring strategy"
+        },
+        {
+          "role": "developer",
+          "task": "Execute refactoring while maintaining functionality"
+        },
+        {
+          "role": "tester",
+          "task": "Ensure all existing tests pass"
+        }
+      ]
+    }
+  }
+}
