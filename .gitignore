@@ -1,3 +1,5 @@
+target/
+
 # Dependencies
 node_modules/
 npm-debug.log*
@@ -50,3 +52,21 @@ Thumbs.db
 
 # Redis dump file
 dump.rdb
+
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Borg Coordinator specific files
+orchestrator.log
+.orchestrator.pid
+workspaces/
+
+# Temporary files
+*.tmp
+*.temp
+.temp/
+
+# AI generated files (optional - uncomment if you want to ignore AI outputs)
+# ai-output/
+# generated/

@@ -320,6 +320,12 @@ impl Orchestrator {
             instance.current_task = Some(task.clone());
             instance.status = InstanceStatus::Working;
             instance.last_activity = Utc::now();
+            
+            // Also store updated instance in Redis
+            if let Err(e) = self.task_queue.store_instance(instance).await {
+                warn!("Failed to store updated instance {} in Redis: {}", instance.id, e);
+            }
+            
             instance.clone()
         };
 
@@ -335,37 +341,62 @@ impl Orchestrator {
 
         info!("Task {} assigned to instance {}", task.id, instance_id);
 
-        // TODO: Actually execute the task via Claude Code process
-        // For now, we'll simulate task execution
-        self.simulate_task_execution(task, instance).await;
+        // Execute the task via Claude Code process
+        self.execute_task_with_claude(task, instance).await;
 
         Ok(())
     }
 
-    // Temporary simulation - replace with actual Claude Code execution
-    async fn simulate_task_execution(&self, mut task: Task, mut instance: ClaudeInstance) {
+    // Execute task with actual Claude Code process
+    async fn execute_task_with_claude(&self, mut task: Task, mut instance: ClaudeInstance) {
         let orchestrator = self.clone();
+        let claude_path = self.config.claude_code_path.clone();
+        
         tokio::spawn(async move {
-            // Simulate work delay
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            info!("Starting Claude Code execution for task {} on instance {}", task.id, instance.id);
             
-            // Simulate completion
-            let result = TaskResult {
-                success: true,
-                output: Some(format!("Simulated completion of task: {}", task.description)),
-                error: None,
-                files_modified: vec!["src/example.rs".to_string()],
-                tests_run: vec![TestResult {
-                    name: "example_test".to_string(),
-                    passed: true,
-                    error: None,
-                }],
+            // Prepare the prompt based on the instance role and task
+            let role_context = match instance.role {
+                InstanceRole::ProjectManager => "You are a Project Manager responsible for planning, coordinating, and breaking down high-level requirements into specific tasks. Analyze the user request and create a detailed project plan.",
+                InstanceRole::Supervisor => "You are a Team Supervisor responsible for architecture decisions, code review coordination, and ensuring best practices across the development team.",
+                InstanceRole::Developer => &format!("You are a {} specializing in {}. Focus on implementing features, fixing bugs, and writing clean, maintainable code.", 
+                    instance.config.name, 
+                    instance.config.preferred_languages.join(", ")),
+                InstanceRole::Tester => "You are a QA Tester responsible for creating comprehensive tests, finding bugs, and ensuring code quality and reliability.",
+                InstanceRole::Reviewer => "You are a Code Reviewer focused on security, performance, best practices, and maintaining code quality standards.",
+                InstanceRole::Researcher => "You are a Researcher responsible for investigating technologies, analyzing requirements, and providing technical recommendations.",
             };
-
-            task.status = TaskStatus::Completed;
-            task.result = Some(result.clone());
+            
+            let full_prompt = format!(
+                "{}\n\nTask: {}\n\nPlease complete this task and provide a detailed summary of what you accomplished.",
+                role_context,
+                task.description
+            );
+            
+            // Execute Claude Code process
+            let result = orchestrator.run_claude_process(&claude_path, &full_prompt, &instance).await;
+            
+            // Update task with result
+            match result {
+                Ok(task_result) => {
+                    task.status = TaskStatus::Completed;
+                    task.result = Some(task_result.clone());
+                    info!("Task {} completed successfully by instance {}", task.id, instance.id);
+                }
+                Err(e) => {
+                    task.status = TaskStatus::Failed;
+                    task.result = Some(TaskResult {
+                        success: false,
+                        output: None,
+                        error: Some(format!("Claude Code execution failed: {}", e)),
+                        files_modified: vec![],
+                        tests_run: vec![],
+                    });
+                    warn!("Task {} failed on instance {}: {}", task.id, instance.id, e);
+                }
+            }
+            
             task.updated_at = Utc::now();
-
             instance.status = InstanceStatus::Idle;
             instance.current_task = None;
             instance.last_activity = Utc::now();
@@ -390,13 +421,111 @@ impl Orchestrator {
 
             // Send event
             if let Err(e) = orchestrator.event_sender.send(OrchestratorEvent::TaskCompleted {
-                task,
-                instance,
-                result,
+                task: task.clone(),
+                instance: instance.clone(),
+                result: task.result.unwrap(),
             }) {
                 warn!("Failed to send task completed event: {}", e);
             }
         });
+    }
+    
+    // Run Claude Code process and capture output
+    async fn run_claude_process(&self, claude_path: &str, prompt: &str, instance: &ClaudeInstance) -> BorgResult<TaskResult> {
+        use std::process::Stdio;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::process::Command;
+        
+        info!("Executing Claude Code for instance {} ({})", instance.config.name, instance.role.as_str());
+        
+        // Build command with role-specific configuration
+        let mut cmd = Command::new(claude_path);
+        
+        // Add environment variables from instance config
+        for (key, value) in &instance.config.environment_vars {
+            cmd.env(key, value);
+        }
+        
+        // Set working directory to current directory (where the tool is run)
+        cmd.current_dir(".");
+        
+        // Configure stdio
+        cmd.stdin(Stdio::piped())
+           .stdout(Stdio::piped())
+           .stderr(Stdio::piped());
+        
+        // Add any command line arguments based on instance config
+        if instance.config.auto_accept_tasks {
+            // Note: Claude Code doesn't have an auto-accept flag yet, but we can configure the prompt
+        }
+        
+        info!("Starting Claude Code process with prompt: {}...", &prompt[..100.min(prompt.len())]);
+        
+        let mut child = cmd.spawn()
+            .map_err(|e| BorgError::TaskExecutionError { 
+                message: format!("Failed to spawn Claude Code process: {}", e) 
+            })?;
+        
+        // Send prompt to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(prompt.as_bytes()).await
+                .map_err(|e| BorgError::TaskExecutionError { 
+                    message: format!("Failed to write prompt to Claude Code: {}", e) 
+                })?;
+            stdin.shutdown().await
+                .map_err(|e| BorgError::TaskExecutionError { 
+                    message: format!("Failed to close stdin: {}", e) 
+                })?;
+        }
+        
+        // Capture output with timeout
+        let output = tokio::time::timeout(
+            tokio::time::Duration::from_secs(instance.config.timeout_seconds),
+            async {
+                let mut stdout_data = Vec::new();
+                let mut stderr_data = Vec::new();
+                
+                if let Some(mut stdout) = child.stdout.take() {
+                    stdout.read_to_end(&mut stdout_data).await?;
+                }
+                if let Some(mut stderr) = child.stderr.take() {
+                    stderr.read_to_end(&mut stderr_data).await?;
+                }
+                
+                let status = child.wait().await?;
+                
+                Ok::<_, std::io::Error>((status, stdout_data, stderr_data))
+            }
+        ).await
+        .map_err(|_| BorgError::TaskExecutionError { 
+            message: format!("Claude Code process timed out after {} seconds", instance.config.timeout_seconds) 
+        })?
+        .map_err(|e| BorgError::TaskExecutionError { 
+            message: format!("Error reading Claude Code output: {}", e) 
+        })?;
+        
+        let (status, stdout_data, stderr_data) = output;
+        let stdout = String::from_utf8_lossy(&stdout_data);
+        let stderr = String::from_utf8_lossy(&stderr_data);
+        
+        let success = status.success();
+        
+        info!("Claude Code process completed with status: {} for instance {}", 
+              if success { "success" } else { "failure" }, instance.config.name);
+        
+        if !success {
+            warn!("Claude Code stderr: {}", stderr);
+        }
+        
+        // TODO: Parse output to extract file modifications and test results
+        // For now, we'll return the raw output
+        Ok(TaskResult {
+            success,
+            output: if !stdout.is_empty() { Some(stdout.to_string()) } else { None },
+            error: if !stderr.is_empty() { Some(stderr.to_string()) } else { None },
+            files_modified: vec![], // TODO: Parse from Claude Code output
+            tests_run: vec![], // TODO: Parse from Claude Code output
+        })
     }
 
     #[allow(dead_code)]
@@ -457,6 +586,56 @@ impl Orchestrator {
             .ok_or(BorgError::InstanceNotFound { id: instance_id })?;
         
         Ok(instance.config.clone())
+    }
+
+    // Process tasks from Redis queue
+    pub async fn start_task_processing(&self) {
+        info!("Starting task processing loop...");
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        
+        loop {
+            interval.tick().await;
+            
+            // Get next task from queue
+            match self.task_queue.get_next_task().await {
+                Ok(Some(task)) => {
+                    info!("Processing task from queue: {} - {}", task.id, task.description);
+                    
+                    // Find best instance for the task
+                    if let Err(e) = self.process_queued_task(task).await {
+                        warn!("Failed to process queued task: {}", e);
+                    }
+                }
+                Ok(None) => {
+                    // No tasks in queue, continue
+                }
+                Err(e) => {
+                    warn!("Error getting task from queue: {}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                }
+            }
+        }
+    }
+
+    async fn process_queued_task(&self, task: Task) -> BorgResult<()> {
+        // Update task in local memory
+        {
+            let mut tasks = self.tasks.write().await;
+            tasks.insert(task.id, task.clone());
+        }
+
+        // Find best instance for the task
+        if task.assigned_to.is_some() {
+            // Task is already assigned to specific instance
+            if let Some(instance_id) = task.assigned_to {
+                self.assign_task_to_instance(task, instance_id).await?;
+            }
+        } else {
+            // Find best available instance
+            self.find_best_instance_for_task(&task).await?;
+        }
+
+        Ok(())
     }
 }
 

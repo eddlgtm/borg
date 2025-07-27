@@ -371,6 +371,9 @@ pub enum BorgError {
     
     #[error("Timeout error: {message}")]
     Timeout { message: String },
+    
+    #[error("Task execution error: {message}")]
+    TaskExecutionError { message: String },
 }
 
 pub type BorgResult<T> = Result<T, BorgError>;

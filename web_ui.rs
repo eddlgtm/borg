@@ -53,12 +53,50 @@ async fn main() -> BorgResult<()> {
 async fn handle_connection(stream: &mut std::net::TcpStream, task_queue: Arc<TaskQueue>) {
     use std::io::{Read, Write};
     
+    // Read the complete request
+    let mut request_data = Vec::new();
     let mut buffer = [0; 1024];
-    if stream.read(&mut buffer).is_err() {
-        return;
+    
+    // Read headers first
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break, // Connection closed
+            Ok(n) => {
+                request_data.extend_from_slice(&buffer[..n]);
+                let request_str = String::from_utf8_lossy(&request_data);
+                
+                // Check if we have the complete headers (double CRLF)
+                if request_str.contains("\r\n\r\n") {
+                    // Check if this is a POST with content
+                    if request_str.starts_with("POST") {
+                        // Extract content length
+                        if let Some(content_length) = extract_content_length(&request_str) {
+                            let headers_end = request_str.find("\r\n\r\n").unwrap() + 4;
+                            let current_body_len = request_data.len() - headers_end;
+                            
+                            // Read remaining body if needed
+                            while current_body_len < content_length {
+                                match stream.read(&mut buffer) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        request_data.extend_from_slice(&buffer[..n]);
+                                        if request_data.len() - headers_end >= content_length {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            Err(_) => return,
+        }
     }
     
-    let request = String::from_utf8_lossy(&buffer[..]);
+    let request = String::from_utf8_lossy(&request_data);
     let request_line = request.lines().next().unwrap_or("");
     
     if request_line.starts_with("GET / ") {
@@ -74,6 +112,11 @@ async fn handle_connection(stream: &mut std::net::TcpStream, task_queue: Arc<Tas
     } else if request_line.starts_with("GET /status") {
         // Handle status request
         let response = handle_status_request(task_queue.clone()).await;
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    } else if request_line.starts_with("POST /request_update") {
+        // Handle project manager update request
+        let response = handle_update_request(&request, task_queue.clone()).await;
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
     } else {
@@ -370,9 +413,14 @@ async fn create_main_page() -> String {
                 <div id="team-info" class="status-grid">
                     <div class="loading"></div>
                 </div>
-                <button type="button" class="refresh-btn" onclick="loadStatus()">
-                    🔄 Refresh
-                </button>
+                <div style="display: flex; gap: 0.5rem; margin-top: 1rem;">
+                    <button type="button" class="refresh-btn" onclick="loadStatus()">
+                        🔄 Refresh
+                    </button>
+                    <button type="button" class="refresh-btn" onclick="requestProjectUpdate()" style="background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%); border-color: var(--accent); color: white;">
+                        📋 Ask PM for Update
+                    </button>
+                </div>
             </div>
             
             <div class="card">
@@ -410,6 +458,44 @@ async fn create_main_page() -> String {
     </div>
 
     <script>
+        async function requestProjectUpdate() {
+            const button = event.target;
+            const originalText = button.innerHTML;
+            button.disabled = true;
+            button.innerHTML = '<div class="loading"></div> Requesting...';
+            
+            try {
+                const response = await fetch('/request_update', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ type: 'project_status_update' })
+                });
+                
+                const result = await response.text();
+                
+                // Show update result
+                const resultDiv = document.getElementById('result');
+                if (response.ok) {
+                    resultDiv.className = 'alert alert-success';
+                    resultDiv.innerHTML = '✅ ' + result.replace(/<[^>]*>/g, '');
+                } else {
+                    resultDiv.className = 'alert alert-error';
+                    resultDiv.innerHTML = '❌ ' + result.replace(/<[^>]*>/g, '');
+                }
+                resultDiv.style.display = 'block';
+                setTimeout(() => {
+                    resultDiv.style.display = 'none';
+                }, 8000);
+                
+                loadStatus();
+            } catch (error) {
+                console.error('Error requesting update:', error);
+            }
+            
+            button.disabled = false;
+            button.innerHTML = originalText;
+        }
+
         async function createTask(event) {
             event.preventDefault();
             
@@ -486,14 +572,27 @@ async fn create_main_page() -> String {
 async fn handle_task_creation(request: &str, task_queue: Arc<TaskQueue>) -> String {
     // Extract JSON from POST body
     let lines: Vec<&str> = request.lines().collect();
+    
+    // Find Content-Length header
+    let content_length = lines.iter()
+        .find(|line| line.to_lowercase().starts_with("content-length:"))
+        .and_then(|line| {
+            line.split(':').nth(1)?.trim().parse::<usize>().ok()
+        })
+        .unwrap_or(0);
+    
+    // Find the start of the body (after empty line)
     let body_start = lines.iter().position(|&line| line.is_empty()).unwrap_or(0) + 1;
     let body = lines[body_start..].join("\n");
     
-    // Clean up the body - remove null bytes and trim
-    let clean_body = body.trim_matches('\0').trim();
+    // Trim to actual content length if available
+    let clean_body = if content_length > 0 && body.len() > content_length {
+        &body[..content_length]
+    } else {
+        body.trim_matches('\0').trim()
+    };
     
-    // Debug: print the body for troubleshooting
-    eprintln!("Received body: '{}'", clean_body);
+    eprintln!("Received body ({}): '{}'", clean_body.len(), clean_body);
     
     let task_data: Result<serde_json::Value, _> = serde_json::from_str(clean_body);
     
@@ -573,20 +672,44 @@ async fn handle_status_request(task_queue: Arc<TaskQueue>) -> String {
         tasks.len()
     ));
     
-    // Team members
+    // Team members with detailed status
     if !instances.is_empty() {
         for instance in &instances {
-            let (status_class, _status_icon) = match instance.status {
+            let (status_class, status_icon) = match instance.status {
                 InstanceStatus::Idle => ("status-idle", "⭕"),
                 InstanceStatus::Working => ("status-working", "🟢"),
                 InstanceStatus::Error => ("status-error", "🔴"),
                 InstanceStatus::Offline => ("status-idle", "⚫"),
             };
             
-            let current_task = if let Some(ref task) = instance.current_task {
-                format!("Working on: {}...", &task.description[..task.description.len().min(25)])
+            let (current_task, task_details) = if let Some(ref task) = instance.current_task {
+                let task_type_icon = match task.task_type {
+                    TaskType::ProjectPlanning => "📋",
+                    TaskType::FeatureImplementation => "⚡",
+                    TaskType::BugFix => "🐛",
+                    TaskType::CodeReview => "👀",
+                    TaskType::TestCreation => "🧪",
+                    TaskType::Research => "🔍",
+                    TaskType::Documentation => "📚",
+                };
+                
+                let priority_color = match task.priority {
+                    TaskPriority::Critical => "color: #ff375f;",
+                    TaskPriority::High => "color: #ff9500;",
+                    TaskPriority::Medium => "color: #00c896;",
+                    TaskPriority::Low => "color: #a0a0a0;",
+                };
+                
+                let task_summary = format!("{} {}...", task_type_icon, &task.description[..task.description.len().min(30)]);
+                let details = format!(
+                    "<div style='font-size: 0.7rem; margin-top: 0.25rem;'><span style='{}'>Priority: {}</span> • Started: {}</div>",
+                    priority_color,
+                    task.priority.as_str(),
+                    task.created_at.format("%H:%M")
+                );
+                (task_summary, details)
             } else {
-                "Available".to_string()
+                ("Available for new tasks".to_string(), String::new())
             };
             
             let role_emoji = match instance.role {
@@ -598,19 +721,31 @@ async fn handle_status_request(task_queue: Arc<TaskQueue>) -> String {
                 InstanceRole::Researcher => "🔍",
             };
             
+            let last_activity = instance.last_activity.format("%H:%M");
+            
             status_html.push_str(&format!(
-                r#"<div class="team-member">
-                    <div class="member-status {}"></div>
-                    <div class="status-icon">{}</div>
-                    <div class="member-info">
-                        <div class="member-name">{}</div>
-                        <div class="member-task">{}</div>
+                r#"<div class="team-member" style="padding: 1rem; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; margin-bottom: 0.5rem;">
+                    <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem;">
+                        <div class="member-status {}"></div>
+                        <div class="status-icon">{}</div>
+                        <div style="flex: 1;">
+                            <div class="member-name" style="font-weight: 600;">{}</div>
+                            <div style="font-size: 0.8rem; color: var(--text-secondary);">Last active: {}</div>
+                        </div>
+                        <div style="font-size: 1.2rem;">{}</div>
+                    </div>
+                    <div class="member-task" style="margin-left: 1.5rem; font-size: 0.85rem; line-height: 1.3;">
+                        {}
+                        {}
                     </div>
                 </div>"#,
                 status_class,
-                role_emoji,
+                status_icon,
                 instance.config.name,
-                current_task
+                last_activity,
+                role_emoji,
+                current_task,
+                task_details
             ));
         }
     }
@@ -653,4 +788,66 @@ async fn handle_status_request(task_queue: Arc<TaskQueue>) -> String {
     }
     
     format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}", status_html.len(), status_html)
+}
+
+async fn handle_update_request(request: &str, task_queue: Arc<TaskQueue>) -> String {
+    // We don't actually need to parse the body for update requests
+    // Just create the status update task directly
+    
+    // Find the Project Manager instance
+    let instances = match task_queue.get_all_instances().await {
+        Ok(instances) => instances,
+        Err(e) => {
+            let response_body = format!("<p style='color: red;'>❌ Failed to get instances: {}</p>", e);
+            return format!("HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}", response_body.len(), response_body);
+        }
+    };
+    
+    let project_manager_id = instances
+        .iter()
+        .find(|instance| instance.role == InstanceRole::ProjectManager)
+        .map(|instance| instance.id);
+    
+    // Create a status update request task for the Project Manager
+    let task = Task {
+        id: uuid::Uuid::new_v4(),
+        task_type: TaskType::ProjectPlanning,
+        description: "Please provide a comprehensive status update on all current projects, team activities, and progress. Include what each team member is working on, any blockers, and next steps.".to_string(),
+        assigned_to: project_manager_id,
+        status: TaskStatus::Pending,
+        priority: TaskPriority::High,
+        dependencies: vec![],
+        result: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    
+    // Store task and add to queue
+    match task_queue.store_task(&task).await {
+        Ok(_) => {
+            // Also add to priority queue for processing
+            if let Err(e) = task_queue.add_task(&task).await {
+                let response_body = format!("<p style='color: red;'>❌ Failed to queue update request: {}</p>", e);
+                return format!("HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}", response_body.len(), response_body);
+            }
+            
+            let response_body = format!(
+                "<p style='color: green;'>✅ Project Manager update requested!</p><p><strong>Request ID:</strong> {}</p><p style='margin-top: 1rem; font-size: 0.9rem; color: #888;'>The Project Manager will provide a comprehensive status update on all current activities and progress.</p>", 
+                task.id
+            );
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}", response_body.len(), response_body)
+        }
+        Err(e) => {
+            let response_body = format!("<p style='color: red;'>❌ Failed to request update: {}</p>", e);
+            format!("HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}", response_body.len(), response_body)
+        }
+    }
+}
+
+fn extract_content_length(request: &str) -> Option<usize> {
+    request.lines()
+        .find(|line| line.to_lowercase().starts_with("content-length:"))
+        .and_then(|line| {
+            line.split(':').nth(1)?.trim().parse().ok()
+        })
 }

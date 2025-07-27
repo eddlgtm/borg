@@ -43,6 +43,12 @@ async fn main() -> BorgResult<()> {
     tracing::info!("Borg Coordinator started successfully");
     tracing::info!("Use Web UI: cargo run --bin web-ui, then open http://localhost:8080");
 
+    // Start task processing loop
+    let orch_clone = orchestrator.clone();
+    tokio::spawn(async move {
+        orch_clone.start_task_processing().await;
+    });
+
     // Keep the process running
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
     loop {
